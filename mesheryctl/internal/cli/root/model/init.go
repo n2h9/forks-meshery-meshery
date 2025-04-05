@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"golang.org/x/mod/semver"
+
+	omap "github.com/wk8/go-ordered-map/v2"
 )
 
 var initModelCmd = &cobra.Command{
@@ -180,6 +183,7 @@ mesheryctl exp model init [model-name] --output-format [json|yaml|csv] (default 
 					},
 				),
 			)
+
 			return nil
 		}()
 
@@ -194,6 +198,65 @@ mesheryctl exp model init [model-name] --output-format [json|yaml|csv] (default 
 				utils.Log.Infof("Removing %s", modelVersionFolder)
 				os.RemoveAll(modelVersionFolder)
 			}
+		}
+
+		// put a model name inside the model file
+		// error in this block does not propagate error to the command output
+		err = func() error {
+			modelFile := filepath.Join(
+				modelVersionFolder,
+				strings.Join(
+					[]string{"model", outputFormat},
+					".",
+				),
+			)
+			b, err := os.ReadFile(modelFile)
+			if err != nil {
+				return errors.Join(
+					fmt.Errorf("could not read from file %s", modelFile),
+					err,
+				)
+			}
+			// var data map[string]any
+			ordered := omap.New[string, interface{}]()
+			// Unmarshal using a custom decoder
+			dec := json.NewDecoder(bytes.NewReader(b))
+			dec.UseNumber() // preserves number formatting
+
+			if err := dec.Decode(&ordered); err != nil {
+				return errors.Join(
+					fmt.Errorf("could not unmarshal bytes from file %s", modelFile),
+					err,
+				)
+			}
+			// if err := json.Unmarshal(bytes, &data); err != nil {
+			// 	return errors.Join(
+			// 		fmt.Errorf("could not unmarshal bytes from file %s", modelFile),
+			// 		err,
+			// 	)
+			// }
+
+			ordered.Set("name", modelName)
+
+			out, err := json.MarshalIndent(ordered, "", "  ")
+			if err != nil {
+				return errors.Join(
+					fmt.Errorf("could not marshal bytes"),
+					err,
+				)
+			}
+
+			if err := os.WriteFile(modelFile, out, initModelFilePerm); err != nil {
+				return errors.Join(
+					fmt.Errorf("could not write to file %s", modelFile),
+					err,
+				)
+			}
+
+			return nil
+		}()
+		if err != nil {
+			utils.Log.Warn(err)
 		}
 
 		// TODO put a model name into generated model file
@@ -214,6 +277,7 @@ func initModelGetValidOutputFormat() []string {
 }
 
 const initModelDirPerm = 0755
+const initModelFilePerm = 0644
 const initModelModelSchema = "schemas/constructs/v1beta1/model/model.json"
 const initModelTemplatePathModelJSON = "json_models/constructs/v1beta1/model.json"
 const initModelTemplatePathComponentJSON = "json_models/constructs/v1beta1/component.json"
