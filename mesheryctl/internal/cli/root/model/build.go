@@ -4,18 +4,41 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/google/uuid"
 	"github.com/layer5io/meshery/mesheryctl/internal/cli/root/config"
 	"github.com/layer5io/meshery/mesheryctl/pkg/utils"
 	meshkitOci "github.com/layer5io/meshkit/models/oci"
 	"github.com/meshery/schemas"
+	"github.com/santhosh-tekuri/jsonschema"
+	jsonschemaFormats "github.com/santhosh-tekuri/jsonschema/formats"
+	jsonschemaLoader "github.com/santhosh-tekuri/jsonschema/loader"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/xeipuuv/gojsonschema"
 )
+
+type urlLoader struct {
+	pathToSchema string
+}
+
+func (ul urlLoader) Load(url string) (io.ReadCloser, error) {
+	// Map the URL to local files
+	if url == "https://schemas.meshery.io/core.json" {
+		localPath := filepath.Join(ul.pathToSchema, "../core.json")
+		return os.Open(localPath)
+	}
+	if strings.HasPrefix(url, "https://schemas.meshery.io/") {
+		localPath := filepath.Join(ul.pathToSchema, strings.TrimPrefix(url, "https://schemas.meshery.io/"))
+		return os.Open(localPath)
+	}
+	return nil, os.ErrNotExist
+}
 
 var buildModelCmd = &cobra.Command{
 	Use:   "build",
@@ -145,24 +168,121 @@ func buildModelValidateModelOverSchema(folder string) error {
 		)
 	}
 
+	jsonschemaFormats.Register("uuid", func(v string) bool {
+		if _, err := uuid.Parse(v); err != nil {
+			utils.Log.Warnf("invalid uuid format %s %v", v, err)
+			return false
+		}
+		return true
+	})
+
 	modelConstruct := "constructs/v1beta1/model/model.json"
 	modelSchema := filepath.Join(tempFolder, modelConstruct)
-	// abs path is necessary to be able to resolve relative refs in schema
-	modelSchemaAbsPath, errAbs := filepath.Abs(modelSchema)
-	if errAbs != nil {
+
+	// modelSchema := "/home/n2/.meshery/tmp-1736933724/constructs/v1beta1/model/model.json"
+	{
+		compiler := jsonschema.NewCompiler()
+		// Turn off auto network fetch
+		jsonschemaLoader.Register(
+			"https",
+			urlLoader{
+				pathToSchema: filepath.Join(tempFolder, "constructs/v1beta1"),
+			})
+		sch, err := compiler.Compile(modelSchema)
+		if err != nil {
+			return ErrModelBuild(
+				errors.Join(
+					errors.New("err compile schema"),
+					err,
+				),
+			)
+		}
+
+		f, err := os.Open(modelFile)
+		if err != nil {
+			return ErrModelBuild(
+				errors.Join(
+					errors.New("err open model file"),
+					err,
+				),
+			)
+		}
+		defer f.Close()
+		// inst, err := jsonschema.DecodeJSON(f)
+		// if err != nil {
+		// 	log.Fatal(err)
+		// }
+
+		err = sch.Validate(f)
+		if err != nil {
+			return ErrModelBuild(
+				errors.Join(
+					errors.New("err validate over schema"),
+					err,
+				),
+			)
+		}
+		utils.Log.Info("valid")
+
+	}
+
+	return nil
+}
+
+func buildModelValidateModelOverSchema2(folder string) error {
+	utils.Log.Infof("Validating meshery model over schema from path %s", folder)
+	// TODO determine format (json, yaml, csv)
+	modelFile := filepath.Join(folder, "model.json")
+
+	utils.Log.Infof("modelFile is %s", modelFile)
+
+	utils.Log.Debug("Creating temp folder")
+	tempFolder, err := createTempFolder()
+	if err != nil {
 		return ErrModelBuild(
 			errors.Join(
-				fmt.Errorf("error determining abs path to schema"),
-				errAbs,
+				fmt.Errorf("failed to create temp folder"),
+				err,
+			),
+		)
+	}
+	utils.Log.Debugf("Created temp folder %s", tempFolder)
+	defer func() {
+		utils.Log.Debug("Removing temp folder")
+		if err := os.RemoveAll(tempFolder); err != nil {
+			utils.Log.Warnf("failed to remove temp folder %s", tempFolder)
+		} else {
+			utils.Log.Debugf("Removed temp folder %s", tempFolder)
+		}
+	}()
+
+	if err := copyEmbeddedDirToLocalFolder("schemas", schemas.Schemas, tempFolder); err != nil {
+		return ErrModelBuild(
+			errors.Join(
+				fmt.Errorf("error copying files from embedded schemas to temp folder"),
+				err,
 			),
 		)
 	}
 
-	schemaLoader := gojsonschema.NewReferenceLoader(
-		fmt.Sprintf("file://%s", modelSchemaAbsPath),
-	)
+	modelConstruct := "constructs/v1beta1/model/model.json"
+	modelSchema := filepath.Join(tempFolder, modelConstruct)
 
-	documentLoader := gojsonschema.NewReferenceLoader(modelFile)
+	// modelSchema := "/home/n2/.meshery/tmp-1736933724/constructs/v1beta1/model/model.json"
+	fileReference := fmt.Sprintf("file://%s", modelSchema)
+	schemaLoader := gojsonschema.NewReferenceLoader(fileReference)
+
+	// documentLoader := gojsonschema.NewReferenceLoader(modelFile)
+	modelFileContent, errReadFile := os.ReadFile(modelFile)
+	if errReadFile != nil {
+		return ErrModelBuild(
+			errors.Join(
+				fmt.Errorf("error read modelFile content"),
+				err,
+			),
+		)
+	}
+	documentLoader := gojsonschema.NewBytesLoader(modelFileContent)
 
 	// Validate
 
